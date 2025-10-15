@@ -107,8 +107,9 @@ class LabelSettingGenerator:
 
     # ---------- 参数收敛 ----------
     def _resolve_label_params(self, bp_params: BPParams, default_logger: logging.Logger) -> LabelSettingParams:
-        if getattr(bp_params, "label_params", None) is not None:
-            params = replace(bp_params.label_params)
+        label_params = getattr(bp_params, "label_setting_params", None)
+        if label_params is not None:
+            params = replace(label_params)
         else:
             params = LabelSettingParams(
                 max_len    = getattr(bp_params, "max_label_len", 5),
@@ -431,6 +432,8 @@ class BPSolver:
         rc_min_global = 0.0 
         no_improve = 0 
         iter_in_node = 0 
+        last_rc_min = 0.0
+        exhausted_neg_cols = False
         while iter_in_node < self.params.max_iterations: 
             iter_in_node += 1 
             # 1) 解 RMP 
@@ -468,9 +471,10 @@ class BPSolver:
                 rc_min_round = min(rc_min_round, min(c.meta.get("rc", 0.0) for c in neg_cols)) 
                 new_cols_total += len(neg_cols) 
                 round_cols += len(neg_cols) 
-            rc_min_global = min(rc_min_global, rc_min_round) 
+            last_rc_min = rc_min_round
             # 3) 停止条件：无负 rc 或者节点内无改进 
             if round_cols == 0: 
+                exhausted_neg_cols = True
                 break 
             if obj + 1e-6 < self.global_best_obj: 
                 no_improve = 0 
@@ -479,7 +483,8 @@ class BPSolver:
                 break 
             if self._timed_out(): 
                 break 
-        return node.rmp.get_objective_value(), rc_min_global, new_cols_total
+        return node.rmp.get_objective_value(), last_rc_min, new_cols_total
+
 
 
     # ---- 分支变量选择 ----
@@ -517,9 +522,7 @@ class BPSolver:
         max_dual = max(dual_vals) if dual_vals else 0.0
         s = sum(dual_vals)
         dual_entropy = 0.0
-        if s > 1e-9:
-            probs = [v/s for v in dual_vals]
-            dual_entropy = -sum(p * math.log(p + 1e-12) for p in probs)
+
 
         # ---- 状态对象 ----
         st = BPStatus(
@@ -548,7 +551,7 @@ class BPSolver:
             coverage_rate * 100
         )
 
-        # ---- 写 CSV 累计 ----
+        # ---- 写 CSV ----
         csv_path = os.path.join(self.params.outdir, "stats.csv")
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="", encoding="utf-8") as f:

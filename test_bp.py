@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     # 构造问题
     depot = Node(0, demand=0.0, tw=(0, 180), service=0.0, x=0.0, y=0.0)
-    cust_nodes = gen_customers(n=40, seed=42)
+    cust_nodes = gen_customers(n=20, seed=42)
     nodes = [depot] + cust_nodes
     customers = [n.id for n in cust_nodes]
     drone = DroneSpec(capacity=8.0, endurance=60.0, speed=5)
@@ -77,14 +77,14 @@ if __name__ == "__main__":
             require_return=True,
             # 下面参数如无特殊处理可去掉
             lambda_route=20.0,
-            # seed=42,
+
             outdir=label_outdir,
             order_strategy="random"
         ),
         rmp_params=RMPParams(
             relax=True,
             lambda_uncovered=1e4,
-            lambda_route=0.0,
+            lambda_route=100.0,
             time_limit=60,
             mip_gap=None,
             outdir=rmp_outdir,

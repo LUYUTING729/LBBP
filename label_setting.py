@@ -281,7 +281,7 @@ def label_setting(
         start_s = max(0.0, ns.tw[0])
         # 等待到最早服务时刻（初始时刻 t=0）
         wait_s = start_s - 0.0
-        cost0 = wait_s + ns.service
+        cost0 = ns.service
 
         # rc0 = cost0 + lambda_route - pi_s
         pi_s = duals.get(s, 0.0) if duals is not None else 0.0

@@ -71,7 +71,7 @@ class InitColumnGenerator:
                 continue
 
             # 选择“到达即服务”的出发时刻，避免等待成本：
-            # start_j = max(a_j, a0 + t1), s_dep = start_j - t1  (>= a0)
+            
             aj, bj = nodes[j].tw
             start_j = max(aj, a0 + t1)
             s_dep = start_j - t1  # 出发时刻（>= a0）

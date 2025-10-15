@@ -44,7 +44,7 @@ class RMPParams:
     # 建模
     relax: bool = True                 # True: LP 放松；False: 0-1 MIP
     lambda_uncovered: float = 1e4      # 未覆盖罚系数（越大→逼近硬覆盖）
-    lambda_route: float = 0.0          # 选路正则（可为 0）
+    lambda_route: float = 10          # 选路正则（可为 0）
     max_routes: Optional[int] = None   # 预留：总路线数上限（当前通过正则化控制）
 
     # 求解器
@@ -117,9 +117,9 @@ class GurobiBackend:
             s.Obj = params.lambda_uncovered
             self.s_vars[i] = s
 
-        # 覆盖约束：s_i >= 1  （后续通过 chgCoeff 动态加入 x_r 系数）
+        # 覆盖约束：s_i == 1  （后续通过 chgCoeff 动态加入 x_r 系数）
         for i in self.customers:
-            c = self.model.addConstr(self.s_vars[i] >= 1.0, name=f"cover[{i}]")
+            c = self.model.addConstr(self.s_vars[i] == 1.0 , name=f"cover[{i}]")
             self.cover_constr[i] = c
 
         # 保持目标只由变量的 Obj 系数构成，无需 setObjective
@@ -143,7 +143,7 @@ class GurobiBackend:
             # 目标：cost + lambda_route
             x.Obj = float(col.cost) + float(self.params.lambda_route)
             self.x_vars[col.id] = x
-
+        
         self.model.update()
         # 填系数
         for i in self.customers:
@@ -386,7 +386,7 @@ class RMP:
     def _append_columns_csv(self, cols: List[Column]) -> None:
         path = os.path.join(self.params.outdir, self.params.columns_csv)
         exists = os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if not exists:
                 w.writerow(["id", "cost", "len_path", "served_size", "served",
