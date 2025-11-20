@@ -35,7 +35,7 @@ if __name__ == "__main__":
     drone = DroneSpec(capacity=8.0, endurance=60.0, speed=1.5)
     prob = Problem(nodes=nodes, customers=customer_ids, drone=drone)
 
-    sols = label_setting(prob, max_len=4, depot_idx=0, logger=logger)
+    sols = label_setting(prob, max_len=4, depot_idx=0, logger=logger,)
 
     logger.info(f"Total solutions found: {len(sols)}")
     depot_sols = [lab for lab in sols if lab.path and lab.path[-1] == 0]

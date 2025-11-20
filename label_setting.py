@@ -26,7 +26,7 @@ class Label:
 
 @dataclass
 class LabelSettingParams:
-    max_len: int = 5
+    max_len: int = 20
     depot_idx: int = 0
     logger: Optional[logging.Logger] = None
     K_per_sig: int = 10

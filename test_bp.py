@@ -67,7 +67,7 @@ if __name__ == "__main__":
     label_outdir = os.path.join("bp_logs", "label_setting")
     bp_params = BPParams(
         label_setting_params=LabelSettingParams(
-            max_len=5,
+            max_len=20,
             depot_idx=0,
             logger=logger,
             K_per_sig=10,
@@ -77,10 +77,8 @@ if __name__ == "__main__":
             require_return=True,
             # 下面参数如无特殊处理可去掉
             lambda_route=20.0,
-
             outdir=label_outdir,
-            order_strategy="random"
-        ),
+            order_strategy="random"),
         rmp_params=RMPParams(
             relax=True,
             lambda_uncovered=1e4,
