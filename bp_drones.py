@@ -8,7 +8,8 @@ import math
 import os
 import logging
 import csv
-from dataclasses import dataclass, field, replace
+import json
+from dataclasses import dataclass, field, replace, asdict
 from typing import List, Dict, Optional, Iterable, Tuple, Any, Sequence, Set, Union
 from truck_solver import TruckSolver, TruckParams
 from rmp import RMP, RMPParams, Column
@@ -16,6 +17,7 @@ from data_model import Problem
 from label_setting import LabelSettingParams, label_setting
 from column_pool import ColumnPool
 from branch_and_bound import BranchEngine, BnBParams
+from logging_utils import init_logging, make_formatter, make_context_filter
 
 # =========================
 # BP 参数 / 统计 / 结果（按你给的定义）
@@ -80,6 +82,8 @@ class BPStatus:
     avg_dual: float                    # 对偶均值
     max_dual: float                    # 对偶最大值
     dual_entropy: float                # 对偶分布熵，用于衡量分布均匀性
+    cut_count: int = 0
+    truck_feasible: Optional[bool] = None
 
 
 @dataclass
@@ -90,6 +94,7 @@ class BPResult:
     selected_columns: List[Column]
     duals: Dict[int, float]
     stats: List[BPStatus]
+    snapshot_paths: Dict[str, str] = field(default_factory=dict)
 class LabelSettingGenerator:
     """
     Column Generator（定价器）：
@@ -141,7 +146,10 @@ class LabelSettingGenerator:
         return outdir
 
     def _prepare_label_logger(self, label_params: LabelSettingParams, outdir: str, fallback: logging.Logger) -> logging.Logger:
-        logger = label_params.logger or fallback
+        base_logger = label_params.logger or fallback
+        base_name = base_logger.name if base_logger else "bp"
+        logger = logging.getLogger(f"{base_name}.label")
+        logger.setLevel(getattr(label_params, "log_level", logging.INFO))
         logfile = os.path.join(outdir, "label_setting.log")
         abs_logfile = os.path.abspath(logfile)
         has_same = False
@@ -152,9 +160,22 @@ class LabelSettingGenerator:
         if not has_same:
             fh = logging.FileHandler(abs_logfile, mode="w", encoding="utf-8")
             fh.setLevel(getattr(label_params, "log_level", logging.INFO))
-            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            formatter = None
+            if base_logger:
+                for h in base_logger.handlers:
+                    if h.formatter:
+                        formatter = h.formatter
+                        for flt in h.filters:
+                            fh.addFilter(flt)
+                        break
+                for flt in base_logger.filters:
+                    fh.addFilter(flt)
+            if formatter is None:
+                formatter = make_formatter()
+                fh.addFilter(make_context_filter())
+            fh.setFormatter(formatter)
             logger.addHandler(fh)
-        logger.propagate = False
+        logger.propagate = True
         label_params.logger = logger
         return logger
 
@@ -422,10 +443,10 @@ class BPSolver:
                              len(node.fixed_one), len(node.fixed_zero))
 
             # 在该节点做列生成与cut分离循环
-            obj, rc_min, new_cols_total = self._column_generation_loop(node)
+            obj, rc_min, new_cols_total, cut_total = self._column_generation_loop(node)
 
             # 记录一发当前状态
-            self._record(iteration, node, obj, rc_min, new_cols_total)
+            self._record(iteration, node, obj, rc_min, new_cols_total, cut_total)
 
             # 超时检查
             if self._timed_out():
@@ -448,6 +469,7 @@ class BPSolver:
                 ]
 
                 feasible, truck_cost, conflict_sets = self.truck_checker.evaluate(picked_cols)
+                self._mark_truck_feasible(feasible)
 
                 if not feasible:
                     # 卡车调度不可行：
@@ -544,8 +566,8 @@ class BPSolver:
                 self._apply_fixed_bounds(right)
 
                 # 立即列生成一轮, 获取左右子节点的下界
-                obj_left, rc_min_left, _ = self._column_generation_loop(left)
-                obj_right, rc_min_right, _ = self._column_generation_loop(right)
+                obj_left, rc_min_left, _, _ = self._column_generation_loop(left)
+                obj_right, rc_min_right, _, _ = self._column_generation_loop(right)
 
                 # 更新伪成本学习
                 self.branch_engine.update_pseudocost(
@@ -564,13 +586,15 @@ class BPSolver:
             # （这里不push当前node，以免死循环；当前node已在_column_generation_loop中拉满）
 
         status = "optimal" if self.global_best_obj < float("inf") else "stopped"
+        snapshot_paths = self._dump_snapshots()
         return BPResult(
             status=status,
             obj_value=self.global_best_obj if status == "optimal" else float("inf"),
             solution=self.global_best_solution,
             selected_columns=self.global_best_cols,
             duals={},  # 可按需回填最终节点的对偶
-            stats=self.stats
+            stats=self.stats,
+            snapshot_paths=snapshot_paths,
         )
 
     # -----------------------------------------------------
@@ -753,10 +777,11 @@ class BPSolver:
     # -----------------------------------------------------
     # 单节点的列生成循环 (RMP ↔ Pricing ↔ Cut分离)
     # -----------------------------------------------------
-    def _column_generation_loop(self, node: BranchNode) -> Tuple[float, float, int]:
+    def _column_generation_loop(self, node: BranchNode) -> Tuple[float, float, int, int]:
         new_cols_total = 0
         last_rc_min = 0.0
         iter_in_node = 0
+        cut_total = 0
 
         while iter_in_node < self.params.max_iterations:
             iter_in_node += 1
@@ -788,6 +813,7 @@ class BPSolver:
             try:
                 x_vals = node.rmp.get_solution_vector()
                 added_cuts = self._separate_and_add_cuts(node, x_vals)
+                cut_total += added_cuts
                 if added_cuts > 0:
                     obj = node.rmp.solve()
                     node.lower_bound = obj
@@ -844,7 +870,7 @@ class BPSolver:
             if self._timed_out():
                 break
 
-        return node.rmp.get_objective_value(), last_rc_min, new_cols_total
+        return node.rmp.get_objective_value(), last_rc_min, new_cols_total, cut_total
 
     # -----------------------------------------------------
     # 对偶稳定化
@@ -871,7 +897,9 @@ class BPSolver:
                 node: BranchNode,
                 obj: float,
                 rc_min: float,
-                new_cols: int) -> None:
+                new_cols: int,
+                cut_count: int,
+                truck_feasible: Optional[bool] = None) -> None:
         """
         记录一次迭代快照，补充扩展指标：
         - coverage_rate: 选中列覆盖的客户占比
@@ -933,17 +961,59 @@ class BPSolver:
             coverage_rate=coverage_rate,
             avg_dual=avg_dual,
             max_dual=max_dual,
-            dual_entropy=dual_entropy
+            dual_entropy=dual_entropy,
+            cut_count=cut_count,
+            truck_feasible=truck_feasible
         )
         self.stats.append(st)
 
         self.logger.info(
-            "[Iter %d][Node %d] obj=%.6f, new_cols=%d, rc_min=%.6g, "
-            "elapsed=%.2fs, gap=%s | cov=%.1f%% avg_dual=%.3f max_dual=%.3f H=%.3f",
-            iteration, node.id, obj, new_cols, rc_min, elapsed,
+            "[Iter %d][Node %d] obj=%.6f, new_cols=%d, cuts=%d, rc_min=%.6g, "
+            "elapsed=%.2fs, gap=%s | cov=%.1f%% avg_dual=%.3f max_dual=%.3f H=%.3f truck=%s",
+            iteration, node.id, obj, new_cols, cut_count, rc_min, elapsed,
             f"{gap:.4%}" if gap < float("inf") else "NA",
-            100.0 * coverage_rate, avg_dual, max_dual, dual_entropy
+            100.0 * coverage_rate, avg_dual, max_dual, dual_entropy,
+            truck_feasible if truck_feasible is not None else "-",
+            extra={"iteration": iteration, "node_id": node.id, "phase": "record"},
         )
+
+    def _mark_truck_feasible(self, feasible: bool) -> None:
+        if not self.stats:
+            return
+        self.stats[-1].truck_feasible = feasible
+
+    def _dump_snapshots(self) -> Dict[str, str]:
+        records = [asdict(st) for st in self.stats]
+        json_path = os.path.join(self.params.outdir, "bp_snapshots.json")
+        csv_path = os.path.join(self.params.outdir, "bp_snapshots.csv")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+
+        headers = [
+            "iteration",
+            "node_id",
+            "obj_value",
+            "best_bound",
+            "gap",
+            "num_columns",
+            "num_new_columns",
+            "time_elapsed",
+            "rc_min",
+            "coverage_rate",
+            "avg_dual",
+            "max_dual",
+            "dual_entropy",
+            "cut_count",
+            "truck_feasible",
+        ]
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            for row in records:
+                writer.writerow({k: row.get(k, "") for k in headers})
+
+        return {"json": json_path, "csv": csv_path}
 
     # -----------------------------------------------------
     # 时间限制
@@ -963,37 +1033,8 @@ class BPSolver:
         创建/复用 solver 级别的 logger，并写入到 bp_events.log
         """
         if logger is not None:
-            return logger
+            child = logger.getChild("bp")
+            child.setLevel(params.log_level)
+            return child
 
-        lg = logging.getLogger(f"BPSolver[{id(self)}]")
-        lg.setLevel(params.log_level)
-
-        # 防止重复 handler
-        need_file_handler = True
-        for h in lg.handlers:
-            if isinstance(h, logging.FileHandler) and \
-               getattr(h, "baseFilename", "").endswith("bp_events.log"):
-                need_file_handler = False
-                break
-
-        if need_file_handler:
-            fh = logging.FileHandler(
-                os.path.join(params.outdir, "bp_events.log"),
-                mode="w",
-                encoding="utf-8"
-            )
-            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            lg.addHandler(fh)
-
-        # 同时也打印到控制台（可按需去掉）
-        need_stream = True
-        for h in lg.handlers:
-            if isinstance(h, logging.StreamHandler):
-                need_stream = False
-                break
-        if need_stream:
-            sh = logging.StreamHandler()
-            sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            lg.addHandler(sh)
-
-        return lg
+        return init_logging(params.outdir, name="bp", level=params.log_level, to_console=True)

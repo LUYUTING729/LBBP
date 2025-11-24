@@ -11,24 +11,7 @@ from bp_drones import BPSolver, BPParams
 from label_setting import LabelSettingParams
 from rmp import RMPParams
 from init_column_generator import generate_init_columns
-
-# ----------------------------
-# 日志工具
-# ----------------------------
-def setup_logger(outdir: str, name: str = "TEST_BP") -> logging.Logger:
-    os.makedirs(outdir, exist_ok=True)
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    if not logger.handlers:
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(ch)
-        fh = logging.FileHandler(os.path.join(outdir, "test_bp.log"), mode="w", encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(fh)
-    return logger
+from logging_utils import init_logging
 
 # ----------------------------
 # 随机生成客户
@@ -51,7 +34,7 @@ def gen_customers(n=20, seed=42) -> List[Node]:
 # ----------------------------
 if __name__ == "__main__":
     OUTDIR = "bp_test_logs"
-    logger = setup_logger(OUTDIR)
+    logger = init_logging(OUTDIR, name="test_bp")
     os.makedirs("bp_logs", exist_ok=True)
 
     # 构造问题
@@ -138,5 +121,7 @@ if __name__ == "__main__":
     }
     with open(sol_path, "w", encoding="utf-8") as f:
         json.dump(final_sol, f, ensure_ascii=False, indent=2)
-    
+
     logger.info("Final solution saved to %s", sol_path)
+    for fmt, path in result.snapshot_paths.items():
+        logger.info("Snapshot (%s) saved to %s", fmt, path)

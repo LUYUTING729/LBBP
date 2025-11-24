@@ -4,7 +4,6 @@ import os
 import math
 import heapq
 import random
-import logging
 from typing import List
 
 # ---- 依赖你的现有模块 ----
@@ -21,6 +20,7 @@ except ImportError:
 
 from init_column_generator import generate_init_columns
 from branch_and_bound import BranchEngine, BnBParams, BranchFix
+from logging_utils import init_logging
 
 
 # ----------------------------
@@ -93,12 +93,10 @@ def apply_fixed_bounds(node: NodeBB, logger: logging.Logger):
 # 入口：构建 RMP(problem) → 加 init 列 → solve → B&B 分支若干节点
 # ----------------------------
 def main():
-    # 基础日志
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    logger = logging.getLogger("TEST_BNB")
-
     outdir = "logs_test_bnb"
     os.makedirs(outdir, exist_ok=True)
+
+    logger = init_logging(outdir, name="test_bnb")
 
     # 1) 构造问题
     prob = build_problem_20(seed=42)
