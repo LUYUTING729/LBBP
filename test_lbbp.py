@@ -11,31 +11,7 @@ from bp_drones import BPSolver, BPParams
 from label_setting import LabelSettingParams
 from rmp import RMPParams
 from init_column_generator import generate_init_columns
-
-
-# ----------------------------
-# 日志工具
-# ----------------------------
-def setup_logger(outdir: str, name: str = "TEST_LBBP") -> logging.Logger:
-    os.makedirs(outdir, exist_ok=True)
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-
-    if not logger.handlers:
-        # console
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(ch)
-
-        # file
-        fh = logging.FileHandler(os.path.join(outdir, "test_lbbp.log"),
-                                 mode="w", encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(fh)
-
-    return logger
+from logging_utils import init_logging
 
 
 # ----------------------------
@@ -71,7 +47,7 @@ if __name__ == "__main__":
     OUTDIR = "lbbp_test_logs"
     os.makedirs(OUTDIR, exist_ok=True)
 
-    logger = setup_logger(OUTDIR)
+    logger = init_logging(OUTDIR, name="test_lbbp")
     os.makedirs("bp_logs", exist_ok=True)
 
     # ================
@@ -223,6 +199,8 @@ if __name__ == "__main__":
         json.dump(final_sol, f, ensure_ascii=False, indent=2)
 
     logger.info("Final solution saved to %s", sol_path)
+    for fmt, path in result.snapshot_paths.items():
+        logger.info("Snapshot (%s) saved to %s", fmt, path)
 
     # 也可以把 BP 的收敛曲线信息 stats 存下来，后面 plot_bp_convergence 用
     stats_path = os.path.join(OUTDIR, "lbbp_stats.json")
@@ -237,6 +215,8 @@ if __name__ == "__main__":
             "num_new_columns": st.num_new_columns,
             "time_elapsed": st.time_elapsed,
             "rc_min": st.rc_min,
+            "cut_count": st.cut_count,
+            "truck_feasible": st.truck_feasible,
         }
         for st in result.stats
     ]

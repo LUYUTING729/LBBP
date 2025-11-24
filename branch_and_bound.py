@@ -7,6 +7,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any
+from logging_utils import init_logging
 
 # ---------------------------
 # 参数与数据类
@@ -100,11 +101,14 @@ class BranchEngine:
         os.makedirs(self.params.outdir, exist_ok=True)
 
         # 日志器
-        self.logger = logger or logging.getLogger("BnB")
+        base_logger = logger or init_logging(
+            self.params.outdir,
+            name="branch",
+            level=self.params.log_level,
+            to_console=False,
+        )
+        self.logger = base_logger.getChild("engine") if logger else base_logger
         self.logger.setLevel(self.params.log_level)
-        fh = logging.FileHandler(os.path.join(self.params.outdir, "branch.log"), mode="a", encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        self.logger.addHandler(fh)
 
         # 伪成本：var_id -> {"obs": n, "pc_up": val, "pc_down": val}
         self.pseudocost: Dict[str, Dict[str, float]] = {}
