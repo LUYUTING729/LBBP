@@ -15,7 +15,7 @@ class _ContextFilter(logging.Filter):
 def _build_formatter() -> logging.Formatter:
     fmt = (
         "%(asctime)s [%(levelname)s] %(name)s "
-        "node=%(node_id)s it=%(iteration)s phase=%(phase)s | %(message)s"
+        "| %(message)s"
     )
     return logging.Formatter(fmt)
 

@@ -17,6 +17,7 @@ from data_model import Problem
 from label_setting import LabelSettingParams, label_setting
 from column_pool import ColumnPool
 from branch_and_bound import BranchEngine, BnBParams
+from cut_generator import CutGenParams, build_cut_sets
 from logging_utils import init_logging, make_formatter, make_context_filter
 
 # =========================
@@ -64,6 +65,22 @@ class BPParams:
     cut_time_limit_per_round: float = 0.5     # 每轮用于分离的时间预算（秒）
     cut_max_add_per_round: int = 30           # 每轮最多新增的不等式数量（总数，含 SRI+Clique）
     cut_violation_tol: float = 1e-6           # 违反阈值（> beta + tol 视为违反）
+    # cut 生成器（可选）
+    cut_gen: Optional[CutGenParams] = None
+
+    # 冲突 cut 配置
+    conflict_cut: "ConflictCutParams" = field(default_factory=lambda: ConflictCutParams())
+
+
+@dataclass
+class ConflictCutParams:
+    # all: 全量列作为一条冲突割
+    # iis_union: IIS 节点映射到列后取并集
+    # iis_per_node: 每个 IIS 节点各生成一条冲突割
+    mode: str = "all"  # "all" | "iis_union" | "iis_per_node"
+    max_sets: int = 5
+    min_set_size: int = 2
+    fallback_to_all: bool = True
 
 
 @dataclass
@@ -275,9 +292,13 @@ class TruckSolverCheck:
     - 调用 TruckSolver 构建并求解单车 VRPTW
     - 返回可行性、成本和冲突集合
     """
-    def __init__(self, truck_solver: TruckSolver, logger: logging.Logger):
+    def __init__(self,
+                 truck_solver: TruckSolver,
+                 logger: logging.Logger,
+                 conflict_params: Optional[ConflictCutParams] = None):
         self.truck_solver = truck_solver
         self.logger = logger
+        self.conflict_params = conflict_params or ConflictCutParams()
 
     def evaluate(self, selected_columns: List[Column]) -> Tuple[bool, Optional[float], List[List[str]]]:
         """
@@ -310,12 +331,8 @@ class TruckSolverCheck:
             feasible = tres.feasible
             truck_cost = tres.cost if feasible else None
             
-            # 从冲突端点集合转换为列id冲突集合（简化：若不可行则把所有列标记为冲突）
             if not feasible:
-                # 可以更精细地处理：根据 tres.conflicts 中的节点id找到相关列
-                conflict_sets = [
-                    [col.id for col in selected_columns]  # 简化：整个集合作为一个冲突
-                ]
+                conflict_sets = self._build_conflict_sets(selected_columns, tres)
             else:
                 conflict_sets = []
             
@@ -332,9 +349,79 @@ class TruckSolverCheck:
             
         except Exception as e:
             self.logger.error("[TruckCheck] Exception during truck evaluation: %s", e)
-            # 发生异常时认为不可行，返回冲突集合为整个选定列集合
-            conflict_sets = [[col.id for col in selected_columns]]
+            conflict_sets = self._build_conflict_sets(selected_columns, None)
             return False, None, conflict_sets
+
+    def _build_conflict_sets(self,
+                             selected_columns: List[Column],
+                             tres: Optional[Any]) -> List[List[str]]:
+        params = self.conflict_params
+        if params.mode == "all":
+            return [self._all_cols(selected_columns)]
+
+        conflict_nodes = []
+        if tres is not None:
+            conflict_nodes = list(getattr(tres, "conflicts", []) or [])
+
+        node_to_cols = self._map_nodes_to_cols(selected_columns)
+        conflict_sets: List[List[str]] = []
+
+        if params.mode == "iis_union":
+            merged = set()
+            for nid in conflict_nodes:
+                merged.update(node_to_cols.get(int(nid), []))
+            if len(merged) >= params.min_set_size:
+                conflict_sets.append(list(merged))
+        elif params.mode == "iis_per_node":
+            for nid in conflict_nodes:
+                cols = node_to_cols.get(int(nid), [])
+                if len(cols) < params.min_set_size:
+                    continue
+                conflict_sets.append(list(cols))
+                if len(conflict_sets) >= params.max_sets:
+                    break
+
+        if not conflict_sets and params.fallback_to_all:
+            conflict_sets = [self._all_cols(selected_columns)]
+
+        return conflict_sets
+
+    @staticmethod
+    def _all_cols(selected_columns: List[Column]) -> List[str]:
+        return [col.id for col in selected_columns]
+
+    def _map_nodes_to_cols(self, selected_columns: List[Column]) -> Dict[int, List[str]]:
+        node_to_cols: Dict[int, List[str]] = {}
+        for col in selected_columns:
+            endpoints = self._column_endpoints(col)
+            for nid in endpoints:
+                node_to_cols.setdefault(int(nid), []).append(col.id)
+        return node_to_cols
+
+    @staticmethod
+    def _column_endpoints(col: Column, depot: int = 0) -> List[int]:
+        s = None
+        e = None
+        path = getattr(col, "path", None)
+        if path:
+            for node in path:
+                if node != depot:
+                    if s is None:
+                        s = int(node)
+                    e = int(node)
+        if s is None:
+            served_set = getattr(col, "served_set", None) or getattr(col, "served", None)
+            if served_set:
+                served_list = sorted(list(served_set))
+                if served_list:
+                    s = int(served_list[0])
+                    e = int(served_list[-1])
+        endpoints = []
+        if s is not None:
+            endpoints.append(s)
+        if e is not None and e != s:
+            endpoints.append(e)
+        return endpoints
 
 
 # =========================================================
@@ -367,6 +454,9 @@ class BPSolver:
 
         self.logger = self._init_logger(logger, self.params)
 
+        # 可选：根据配置生成 cut 列表
+        self._apply_cut_generation()
+
         # 子问题定价器（label setting / pricing）
         self.cg = LabelSettingGenerator(problem, self.params, self.logger)
 
@@ -390,21 +480,15 @@ class BPSolver:
         truck_solver = TruckSolver(
             problem=problem,
             depot_idx=0,  # depot 在 problem.customers[0]
-            params=TruckParams(
-                truck_speed=1.0,            # 卡车速度（若有时间矩阵则不用）
-                truck_cost_per_time=1.0,    # 单位时间成本
-                bigM_time=1e5,              # 时间约束用的大 M
-                time_limit=5.0,             # 每个VRPTW求解的时间限制
-                mip_gap=0.01,               # MIP gap
-                log_to_console=False        # 不打印 Gurobi 日志
-            ),
+            params=problem.truck,
             logger=self.logger
         )
 
         # 卡车子问题检查器（Logic-Based Benders）
         self.truck_checker = TruckSolverCheck(
             truck_solver=truck_solver,
-            logger=self.logger
+            logger=self.logger,
+            conflict_params=self.params.conflict_cut
         )
 
         # 全局计数/记录
@@ -477,14 +561,29 @@ class BPSolver:
                     #   基于 conflict_sets 来做更精细的冲突割
                     self.logger.info("[Node %d] Truck infeasible. Add conflict cut and reprocess.",
                                      node.id)
-                    node.rmp.add_conflict_cut(selected_col_ids)
+                    if conflict_sets:
+                        for cset in conflict_sets:
+                            node.rmp.add_conflict_cut(cset)
+                    else:
+                        node.rmp.add_conflict_cut(selected_col_ids)
                     # 重新 push 当前节点，因 RMP 被加强，继续探索
                     heapq.heappush(pq, node)
                     continue
 
-                else:
-                    # 卡车可行：
-                    #   -> 对该集合 S 加 θ_truck 最优性割
+                # 卡车可行：检查 θ_cut 是否被触发，若添加了割必须重定价
+                theta_tol = max(1e-6, abs(self.params.rc_tolerance))
+                theta_now = 0.0
+                try:
+                    theta_now = node.rmp.get_theta_truck()
+                except Exception:
+                    pass
+
+                need_reprice = False
+                refined_obj = node.rmp.get_objective_value()
+                if truck_cost is None:
+                    truck_cost = 0.0
+
+                if theta_now < float(truck_cost) - theta_tol:
                     bigM = getattr(self.params.rmp_params, "bigM_truck", 1e5)
                     self.logger.info("[Node %d] Truck feasible. Add theta cut with cost=%.6f.",
                                      node.id, float(truck_cost))
@@ -496,36 +595,51 @@ class BPSolver:
                     )
                     refined_obj = node.rmp.solve()
                     node.lower_bound = refined_obj
-
-                    # 更新全局最好整数上界 (incumbent)
-                    if refined_obj < self.global_best_obj:
-                        self.global_best_obj = refined_obj
-                        self.global_best_solution = node.rmp.get_solution_vector()
-                        self.global_best_cols = node.rmp.get_selected_columns()
-                        # 打印一次成本拆分（若你在 RMP 实现了 get_cost_breakdown）
-                        try:
-                            parts = node.rmp.get_cost_breakdown()
-                            self.logger.info(
-                                "[Node %d] Cost breakdown: truck=%.6f, drone_flt=%.6f, startup=%.6f | total_parts=%.6f, rmp_obj=%.6f",
-                                node.id,
-                                parts.get("truck_cost", 0.0),
-                                parts.get("drone_flight_cost", 0.0),
-                                parts.get("drone_startup_cost", 0.0),
-                                parts.get("total_by_parts", 0.0),
-                                parts.get("rmp_objective", refined_obj)
-                            )
-                        except Exception:
-                            pass
-
-                    theta_now = 0.0
+                    need_reprice = True
                     try:
                         theta_now = node.rmp.get_theta_truck()
                     except Exception:
+                        theta_now = 0.0
+                    self.logger.info(
+                        "[Node %d] Theta tightened to %.6f after cut (truck_cost=%.6f).",
+                        node.id, theta_now, float(truck_cost)
+                    )
+
+                # 更新全局最好整数上界 (incumbent)
+                if refined_obj < self.global_best_obj:
+                    self.global_best_obj = refined_obj
+                    self.global_best_solution = node.rmp.get_solution_vector()
+                    self.global_best_cols = node.rmp.get_selected_columns()
+                    # 打印一次成本拆分（若你在 RMP 实现了 get_cost_breakdown）
+                    try:
+                        parts = node.rmp.get_cost_breakdown()
+                        self.logger.info(
+                            "[Node %d] Cost breakdown: truck=%.6f, drone_flt=%.6f, startup=%.6f | total_parts=%.6f, rmp_obj=%.6f",
+                            node.id,
+                            parts.get("truck_cost", 0.0),
+                            parts.get("drone_flight_cost", 0.0),
+                            parts.get("drone_startup_cost", 0.0),
+                            parts.get("total_by_parts", 0.0),
+                            parts.get("rmp_objective", refined_obj)
+                        )
+                    except Exception:
                         pass
-                    self.logger.info("[Node %d] Integer+Feasible incumbent updated. θ_truck=%.6f, total_obj=%.6f",
-                                     node.id, theta_now, refined_obj)
-                    # 整数可行节点 -> 不再分支，继续处理队列的下一个节点
+
+                try:
+                    theta_now = node.rmp.get_theta_truck()
+                except Exception:
+                    theta_now = 0.0
+                self.logger.info("[Node %d] Integer+Feasible incumbent updated. θ_truck=%.6f, total_obj=%.6f",
+                                 node.id, theta_now, refined_obj)
+
+                if need_reprice:
+                    # 添加了 θ_cut，改变了对偶，必须重跑定价确认无负 rc
+                    heapq.heappush(pq, node)
+                    self.logger.info("[Node %d] Re-queue node for re-pricing after theta cut.", node.id)
                     continue
+
+                # 没有修改 θ_cut，直接进入下一个节点
+                continue
 
             # =====================================================
             # CASE B: 解是分数解（有fractional）
@@ -694,6 +808,46 @@ class BPSolver:
                 node.rmp.add_clique(key=key, Q=Q, rhs=rhs)
             except Exception as e:
                 self.logger.warning("Add static Clique[%s] failed: %s", key, e)
+
+    def _apply_cut_generation(self) -> None:
+        cut_gen = getattr(self.params, "cut_gen", None)
+        if not cut_gen or not cut_gen.enabled:
+            return
+        cuts = build_cut_sets(self.problem, cut_gen, self.logger)
+
+        if cut_gen.append:
+            self._merge_cut_list(self.params.sri_static, cuts.sri_static)
+            self._merge_cut_list(self.params.sri_candidates, cuts.sri_candidates)
+            self._merge_cut_list(self.params.clique_static, cuts.clique_static)
+            self._merge_cut_list(self.params.clique_candidates, cuts.clique_candidates)
+        else:
+            if cuts.sri_static:
+                self.params.sri_static = list(cuts.sri_static)
+            if cuts.sri_candidates:
+                self.params.sri_candidates = list(cuts.sri_candidates)
+            if cuts.clique_static:
+                self.params.clique_static = list(cuts.clique_static)
+            if cuts.clique_candidates:
+                self.params.clique_candidates = list(cuts.clique_candidates)
+
+        self.logger.info(
+            "CutGen applied: sri_static=%d sri_candidates=%d clq_static=%d clq_candidates=%d",
+            len(self.params.sri_static),
+            len(self.params.sri_candidates),
+            len(self.params.clique_static),
+            len(self.params.clique_candidates),
+        )
+
+    @staticmethod
+    def _merge_cut_list(target: List[Tuple[str, Iterable[int], Union[int, float]]],
+                        incoming: List[Tuple[str, Iterable[int], Union[int, float]]]) -> None:
+        if not incoming:
+            return
+        existing = {str(k) for k, _, _ in target}
+        for key, sset, rhs in incoming:
+            if str(key) in existing:
+                continue
+            target.append((str(key), list(sset), float(rhs)))
 
     # -----------------------------------------------------
     # Cut 分离器（SRI / Clique 的在线分离）
@@ -1010,8 +1164,9 @@ class BPSolver:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
-            for row in records:
-                writer.writerow({k: row.get(k, "") for k in headers})
+            if records:  # 只有当有记录时才写入数据
+                for row in records:
+                    writer.writerow({k: row.get(k, "") for k in headers})
 
         return {"json": json_path, "csv": csv_path}
 

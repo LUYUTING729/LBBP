@@ -59,6 +59,27 @@ def feasibility_pruning(
 
     return False, ""
 
+# ====== Backward epsilon-dominance: time larger is better ======
+def relaxed_pareto_dominance_backward(
+    cand: Label,
+    pool: List[Label],
+    eps: float,
+    duals: Optional[Dict[int, float]],
+) -> Tuple[bool, str]:
+    """
+    Return (dominated?, reason) for backward labels where time is a latest start.
+    """
+    rc_c, sc_c, t_c = cand.red_cost, cand.served_count, cand.time
+    tol = abs(rc_c) * eps + 1e-9
+
+    for L in pool:
+        rc, sc, t = L.red_cost, L.served_count, L.time
+        not_worse = (rc <= rc_c + tol) and (sc >= sc_c) and (t >= t_c - 1e-9)
+        strictly_better = (rc < rc_c - tol) or (sc > sc_c) or (t > t_c + 1e-9)
+        if not_worse and strictly_better:
+            return True, f"dominated_by(rc={rc:.4f},sc={sc},t={t:.2f})"
+    return False, ""
+
 # ====== ε-支配：主指标 red_cost（越小越好），辅指标 served_count（越大越好），再看 time（越小越好） ======
 def relaxed_pareto_dominance(
     cand: Label,
@@ -95,6 +116,19 @@ def _kbest_insert(
     bucket.append(L)
     # 以 rc 为主键，served_count 次键（降序），time 次次键（升序）
     bucket.sort(key=lambda z: (round(z.red_cost, 8), -z.served_count, z.time))
+    if len(bucket) > K:
+        del bucket[K:]
+
+def _kbest_insert_backward(
+    labels_by_sig: Dict[tuple, List[Label]],
+    sig: tuple,
+    L: Label,
+    K: int,
+):
+    bucket = labels_by_sig[sig]
+    bucket.append(L)
+    # time is latest start, so prefer larger time for backward labels
+    bucket.sort(key=lambda z: (round(z.red_cost, 8), -z.served_count, -z.time))
     if len(bucket) > K:
         del bucket[K:]
 
@@ -233,6 +267,73 @@ def make_signature_fn(nodes: List[Any], params: LabelSettingParams):
         "none": none_sig,
     }
     return mapping.get(strategy, node_served_timebin)
+
+# ====== Build a full label by forward simulation of a path ======
+def simulate_path_label(
+    problem,
+    path: List[int],
+    duals: Optional[Dict[int, float]],
+    lambda_route: float,
+) -> Optional[Label]:
+    if not path:
+        return None
+    nodes = problem.nodes
+    Q = problem.drone.capacity
+    E = problem.drone.endurance
+
+    served: set[int] = set()
+    load = 0.0
+    energy = E
+    cost = 0.0
+    red_cost = float(lambda_route)
+    time = 0.0
+    latest_departure = float("inf")
+
+    for idx, nid in enumerate(path):
+        n = nodes[nid]
+        if nid in served:
+            return None
+        load += n.demand
+        if load > Q + 1e-9:
+            return None
+        if idx == 0:
+            start = max(0.0, n.tw[0])
+            if start > n.tw[1] + 1e-9:
+                return None
+            time = start
+            cost += n.service
+            red_cost += n.service - (duals.get(nid, 0.0) if duals is not None else 0.0)
+            latest_departure = n.tw[1] - start
+        else:
+            prev = path[idx - 1]
+            fly = problem.flight_time(prev, nid)
+            if fly > energy + 1e-9:
+                return None
+            arr = time + nodes[prev].service + fly
+            start = max(arr, n.tw[0])
+            if start > n.tw[1] + 1e-9:
+                return None
+            wait = start - arr
+            d_cost = fly + wait + n.service
+            cost += d_cost
+            red_cost += d_cost - (duals.get(nid, 0.0) if duals is not None else 0.0)
+            energy -= fly
+            time = start
+            latest_departure = min(latest_departure, n.tw[1] - start)
+        served.add(nid)
+
+    return Label(
+        node=path[-1],
+        time=time,
+        load=load,
+        energy=energy,
+        path=list(path),
+        cost=cost,
+        latest_departure=latest_departure,
+        served_count=len(path),
+        covered_set=frozenset(served),
+        red_cost=red_cost,
+    )
 
 # ====== 主函数 ======
 def label_setting(
@@ -379,5 +480,280 @@ def label_setting(
         logger.info(
             "LabelSetting done: kept=%d, buckets=%d, K=%d, eps=%.3f, require_return=%s",
             len(solutions), len(labels_by_sig), K_per_sig, eps, require_return
+        )
+    return solutions
+
+# ====== bidirectional label setting (override) ======
+def label_setting(
+    problem,
+    params: Optional[LabelSettingParams] = None,
+) -> List[Label]:
+    """
+    Generate labels (candidate routes) with bidirectional labeling.
+    Reduced cost is consistent with RMP:
+        rc = cost + lambda_route - sum_{i in covered} pi_i
+    """
+    # -------- parameter normalization --------
+    if params is None:
+        params = LabelSettingParams()
+
+    depot_idx      = params.depot_idx
+    logger         = params.logger
+    K_per_sig      = params.K_per_sig
+    eps            = params.eps
+    duals          = params.duals
+    require_return = params.require_return
+    lambda_route   = params.lambda_route
+    max_len_total  = getattr(params, "max_len", 0) or 0
+
+    nodes = problem.nodes
+    Q = problem.drone.capacity
+    E = problem.drone.endurance
+
+    signature = make_signature_fn(nodes, params)
+    labels_by_sig_f: Dict[tuple, List[Label]] = defaultdict(list)
+    labels_by_sig_b: Dict[tuple, List[Label]] = defaultdict(list)
+    labels_by_sig_out: Dict[tuple, List[Label]] = defaultdict(list)
+
+    def try_dominance_f(L, sig_bucket):
+        if params and getattr(params, "disable_dominance", False):
+            return False, ""
+        return relaxed_pareto_dominance(L, sig_bucket, eps, duals)
+
+    def try_dominance_b(L, sig_bucket):
+        if params and getattr(params, "disable_dominance", False):
+            return False, ""
+        return relaxed_pareto_dominance_backward(L, sig_bucket, eps, duals)
+
+    def try_dominance_out(L, sig_bucket):
+        if params and getattr(params, "disable_dominance", False):
+            return False, ""
+        return relaxed_pareto_dominance(L, sig_bucket, eps, duals)
+
+    order = _expansion_order(problem.customers, nodes, duals, params)
+
+    if max_len_total <= 0:
+        max_len_total = len(problem.customers) if problem.customers else 1
+    forward_max = max(1, (max_len_total + 1) // 2)
+    backward_max = max(1, max_len_total - forward_max + 1)
+
+    # -------- forward labels --------
+    f_stack: List[Label] = []
+    forward_by_node: Dict[int, List[Label]] = defaultdict(list)
+
+    for s in problem.customers:
+        ns = nodes[s]
+        start_s = max(0.0, ns.tw[0])
+        cost0 = ns.service
+        pi_s = duals.get(s, 0.0) if duals is not None else 0.0
+        rc0 = (cost0 + lambda_route) - pi_s
+
+        init = Label(
+            node=s, time=start_s, load=ns.demand, energy=E,
+            path=[s], cost=cost0, latest_departure=ns.tw[1] - start_s,
+            served_count=1, covered_set=frozenset({s}), red_cost=rc0
+        )
+
+        pruned, reason = feasibility_pruning(init, problem, depot_idx, require_return)
+        if pruned:
+            if logger: logger.debug(f"[INIT-PRUNE] {init.path} -> {reason}")
+            continue
+
+        sig = signature(init)
+        dom, reason = try_dominance_f(init, labels_by_sig_f[sig])
+        if dom:
+            if logger: logger.debug(f"[INIT-DOM] {init.path} -> {reason}")
+            continue
+
+        _kbest_insert(labels_by_sig_f, sig, init, K_per_sig)
+        f_stack.append(init)
+
+    while f_stack:
+        L = f_stack.pop()
+        forward_by_node[L.node].append(L)
+        if L.served_count >= forward_max:
+            continue
+
+        i = L.node
+        service_i = nodes[i].service
+        arr_i = L.time + service_i
+
+        for j in order:
+            if j in L.path:
+                continue
+            dj = nodes[j].demand
+            if L.load + dj > Q:
+                continue
+            fly_ij = problem.flight_time(i, j)
+            if fly_ij > L.energy:
+                continue
+
+            arr = arr_i + fly_ij
+            aj, bj = nodes[j].tw
+            start_j = max(arr, aj)
+            if start_j > bj + 1e-9:
+                continue
+            wait_j = start_j - arr
+
+            d_cost = fly_ij + wait_j + nodes[j].service
+            pi_j = duals.get(j, 0.0) if duals is not None else 0.0
+            d_rc = d_cost - pi_j
+
+            newL = Label(
+                node=j,
+                time=start_j,
+                load=L.load + dj,
+                energy=L.energy - fly_ij,
+                path=L.path + [j],
+                cost=L.cost + d_cost,
+                latest_departure=min(L.latest_departure, bj - start_j),
+                served_count=L.served_count + 1,
+                covered_set=L.covered_set | {j},
+                red_cost=L.red_cost + d_rc
+            )
+
+            pruned, reason = feasibility_pruning(newL, problem, depot_idx, require_return)
+            if pruned:
+                if logger: logger.debug(f"[PRUNE] {newL.path} -> {reason}")
+                continue
+
+            sig = signature(newL)
+            dom, reason = try_dominance_f(newL, labels_by_sig_f[sig])
+            if dom:
+                if logger: logger.debug(f"[DOM] {newL.path} -> {reason}")
+                continue
+
+            _kbest_insert(labels_by_sig_f, sig, newL, K_per_sig)
+            f_stack.append(newL)
+
+    # -------- backward labels --------
+    b_stack: List[Label] = []
+    backward_by_node: Dict[int, List[Label]] = defaultdict(list)
+
+    for s in problem.customers:
+        ns = nodes[s]
+        latest_s = ns.tw[1]
+        if latest_s < ns.tw[0] - 1e-9:
+            continue
+        cost0 = ns.service
+        pi_s = duals.get(s, 0.0) if duals is not None else 0.0
+        rc0 = cost0 - pi_s
+        init = Label(
+            node=s, time=latest_s, load=ns.demand, energy=E,
+            path=[s], cost=cost0, latest_departure=latest_s - ns.tw[0],
+            served_count=1, covered_set=frozenset({s}), red_cost=rc0
+        )
+
+        sig = signature(init)
+        dom, reason = try_dominance_b(init, labels_by_sig_b[sig])
+        if dom:
+            if logger: logger.debug(f"[B-INIT-DOM] {init.path} -> {reason}")
+            continue
+
+        _kbest_insert_backward(labels_by_sig_b, sig, init, K_per_sig)
+        b_stack.append(init)
+
+    while b_stack:
+        L = b_stack.pop()
+        backward_by_node[L.node].append(L)
+        if L.served_count >= backward_max:
+            continue
+
+        j = L.node
+        if L.time < nodes[j].tw[0] - 1e-9:
+            continue
+
+        for i in order:
+            if i in L.path:
+                continue
+            di = nodes[i].demand
+            if L.load + di > Q:
+                continue
+            fly_ij = problem.flight_time(i, j)
+            if fly_ij > L.energy:
+                continue
+
+            latest_i = min(nodes[i].tw[1], L.time - fly_ij - nodes[i].service)
+            if latest_i < nodes[i].tw[0] - 1e-9:
+                continue
+
+            d_cost = fly_ij + nodes[i].service
+            pi_i = duals.get(i, 0.0) if duals is not None else 0.0
+            d_rc = d_cost - pi_i
+
+            newL = Label(
+                node=i,
+                time=latest_i,
+                load=L.load + di,
+                energy=L.energy - fly_ij,
+                path=[i] + L.path,
+                cost=L.cost + d_cost,
+                latest_departure=min(L.latest_departure, latest_i - nodes[i].tw[0]),
+                served_count=L.served_count + 1,
+                covered_set=L.covered_set | {i},
+                red_cost=L.red_cost + d_rc
+            )
+
+            sig = signature(newL)
+            dom, reason = try_dominance_b(newL, labels_by_sig_b[sig])
+            if dom:
+                if logger: logger.debug(f"[B-DOM] {newL.path} -> {reason}")
+                continue
+
+            _kbest_insert_backward(labels_by_sig_b, sig, newL, K_per_sig)
+            b_stack.append(newL)
+
+    # -------- join forward/backward --------
+    solutions: List[Label] = []
+    seen_paths = set()
+
+    for mid in set(forward_by_node.keys()) | set(backward_by_node.keys()):
+        f_list = forward_by_node.get(mid, [])
+        b_list = backward_by_node.get(mid, [])
+        if not f_list or not b_list:
+            continue
+
+        for f in f_list:
+            for b in b_list:
+                combined_len = f.served_count + b.served_count - 1
+                if combined_len > max_len_total:
+                    continue
+                if f.time > b.time + 1e-9:
+                    continue
+                if (f.covered_set & b.covered_set) - {mid}:
+                    continue
+                if f.load + b.load - nodes[mid].demand > Q + 1e-9:
+                    continue
+                if f.energy + b.energy < E - 1e-9:
+                    continue
+
+                path = f.path + b.path[1:]
+                key = tuple(path)
+                if key in seen_paths:
+                    continue
+
+                lab = simulate_path_label(problem, path, duals, lambda_route)
+                if lab is None:
+                    continue
+                pruned, reason = feasibility_pruning(lab, problem, depot_idx, require_return)
+                if pruned:
+                    if logger: logger.debug(f"[JOIN-PRUNE] {lab.path} -> {reason}")
+                    continue
+
+                sig = signature(lab)
+                dom, reason = try_dominance_out(lab, labels_by_sig_out[sig])
+                if dom:
+                    if logger: logger.debug(f"[JOIN-DOM] {lab.path} -> {reason}")
+                    continue
+
+                _kbest_insert(labels_by_sig_out, sig, lab, K_per_sig)
+                solutions.append(lab)
+                seen_paths.add(key)
+
+    if logger:
+        total_buckets = sum(len(v) for v in labels_by_sig_out.values())
+        logger.info(
+            "LabelSetting done: kept=%d, buckets=%d, K=%d, eps=%.3f, require_return=%s",
+            len(solutions), len(labels_by_sig_out), K_per_sig, eps, require_return
         )
     return solutions

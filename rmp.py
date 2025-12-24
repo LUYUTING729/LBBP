@@ -330,7 +330,7 @@ class GurobiBackend:
     
     def get_theta_value(self) -> float:
         try:
-            return float(self.theta_var.X)
+            return float(self.theta_truck.X)
         except Exception:
             return 0.0
     def add_columns(self, cols: List[Column], incidence: Dict[int, Dict[str, float]]):
@@ -657,6 +657,19 @@ class RMP:
 
     def get_solution_vector(self) -> Dict[str, float]:
         return dict(self._x_values)
+
+    def get_theta_truck(self) -> float:
+        """
+        Return current θ_truck value; safe fallback to 0.0 if unavailable.
+        """
+        try:
+            return float(self.backend.get_theta_value())
+        except Exception:
+            try:
+                theta = getattr(self.backend, "theta_truck", None)
+                return float(theta.X) if theta is not None else 0.0
+            except Exception:
+                return 0.0
 
     def get_objective_value(self) -> float:
         return float(self._objective_value)

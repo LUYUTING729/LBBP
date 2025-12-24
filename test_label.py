@@ -1,6 +1,6 @@
 import random
 import logging
-from data_model import Node, DroneSpec, Problem
+from data_model import Node, DroneSpec, Problem, TruckParams
 from label_setting import label_setting
 
 # 配置日志
@@ -31,11 +31,16 @@ if __name__ == "__main__":
     cust_nodes = gen_customers(n=20, seed=42)
     nodes = [depot] + cust_nodes
     customer_ids = [n.id for n in cust_nodes]
-
+    truck = TruckParams(
+        truck_speed=4,            # 卡车速度（距离/时间）         
+        truck_cost_per_time=1.0,    # 卡车单位时间成本
+        bigM_time=1e5,              # 时间约束用的大 M
+        time_limit=300              # 每个 VRPTW 求解的时间限制
+    )
     drone = DroneSpec(capacity=8.0, endurance=60.0, speed=1.5)
-    prob = Problem(nodes=nodes, customers=customer_ids, drone=drone)
-
-    sols = label_setting(prob, max_len=4, depot_idx=0, logger=logger,)
+    prob = Problem(nodes=nodes, customers=customer_ids, drone=drone, truck=truck)
+    logger.info("Problem instance created with %d customers.", len(customer_ids))   
+    sols = label_setting(prob)
 
     logger.info(f"Total solutions found: {len(sols)}")
     depot_sols = [lab for lab in sols if lab.path and lab.path[-1] == 0]

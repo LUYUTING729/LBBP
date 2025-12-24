@@ -6,7 +6,7 @@ import logging
 from typing import List
 import matplotlib.pyplot as plt  # 预留后续可视化使用
 
-from data_model import Node, DroneSpec, Problem
+from data_model import Node, DroneSpec, Problem, TruckParams
 from bp_drones import BPSolver, BPParams
 from label_setting import LabelSettingParams
 from rmp import RMPParams
@@ -53,29 +53,31 @@ if __name__ == "__main__":
     # ================
     # 构造问题实例
     # ================
-    depot = Node(
-        0,
-        demand=0.0,
-        tw=(0, 180),
-        service=0.0,
-        x=0.0,
-        y=0.0
-    )
+    start_depot = Node(0, demand=0.0, tw=(0, 180), service=0.0, x=0.0, y=0.0)
+    end_depot = Node(31, demand=0.0, tw=(0, 1800), service=0.0, x=0.0, y=0.0)
     cust_nodes = gen_customers(n=20, seed=42)
-    nodes = [depot] + cust_nodes
+    nodes = [start_depot] + cust_nodes + [end_depot]
     customers = [n.id for n in cust_nodes]
 
     # 无人机参数
     drone = DroneSpec(
         capacity=8.0,   # 载重上限
         endurance=60.0, # 最大可飞行时间
-        speed=5.0       # 飞行速度 距离/时间
+        speed=8     # 飞行速度 距离/时间
+    )
+
+    truck = TruckParams(
+        truck_speed=4,            # 卡车速度（距离/时间）         
+        truck_cost_per_time=1.0,    # 卡车单位时间成本
+        bigM_time=1e5,              # 时间约束用的大 M
+        time_limit=300              # 每个 VRPTW 求解的时间限制
     )
 
     prob = Problem(
         nodes=nodes,
         customers=customers,
-        drone=drone
+        drone=drone,
+        truck=truck
     )
 
     # ================
